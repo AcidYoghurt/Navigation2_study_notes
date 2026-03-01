@@ -1,0 +1,20 @@
+<!-- 声明一个插件动态库（对应 CMake 里的 add_library 名字），后面给出 CMakeLists.txt -->
+<library path="nav2_custom_planner">
+
+    <!-- 声明一个可被 pluginlib 加载的类 -->
+    <!-- 参数： -->
+    <!-- name：插件唯一ID：代码里 createSharedInstance() 用的字符串，这个字符串可以任意的，可以是AStarPlanner，也可以是plan_system/AStarPlanner(一般使用这种) -->
+    <!-- type：真正的 C++ 类名（必须包含完整 namespace） -->
+    <!-- base_class_type：插件基类（必须和 ClassLoader 的基类一致） -->
+    <class
+            name="nav2_planner_system/CustomPlanner"
+            type="nav2_planner_system::CustomPlanner"
+            base_class_type="nav2_core::GlobalPlanner">
+
+        <!-- 描述信息：给人看的，不影响程序运行 -->
+        <description>
+            自定义nav2规划器
+        </description>
+    </class>
+
+</library>
