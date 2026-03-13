@@ -1,31 +1,33 @@
 # 1 导航概念
 
-## 1.1 导航服务器
+## 导航服务器
 
-> NAV2包含了四个**动作服务器（ROS2中的Action通讯）**，分别是：`规划器`、`平滑器`、`控制器`和`恢复服务器`
+> NAV2的**五个核心动作服务器（ROS2中的Action通讯）**，有：`规划器`、`控制器`、`平滑器`、`行为服务器`、`路径服务器`
 
-- NAV2 四大导航服务器的**整体流程图**：
+- NAV2 导航服务器的**整体流程图**：
 
   ```mermaid
   flowchart LR
-      Goal[目标点] --> Planner[规划器服务器]
-      Planner --> Smoother[平滑器服务器]
-      Smoother --> Controller[控制器服务器]
+      Goal[目标点 / 目标 Pose] --> Planner[Planner Server<br>计算全局路径<br>插件化支持多种规划算法]
+      Planner --> Smoother[Smoother Server<br>优化/平滑路径<br>减少折角，提高安全距离]
+      Smoother --> Controller[Controller Server<br>跟踪路径生成控制量<br>支持多种控制器插件]
       Controller -->|成功| CmdVel[发布 cmd_vel 速度指令]
-      Controller -->|失败| Recovery[恢复服务器]
-      Recovery -->|自救成功| Planner
-  
+      Controller -->|失败| Behavior[Behavior Server<br>执行恢复或自定义行为<br>共享本地 costmap 等资源]
+      Behavior -->|自救成功| Planner
+      Planner --> Route[Route Server<br>基于导航图计算路线<br>适用于 lane/teach-and-repeat/urban 路线]
+      Route --> Planner
   ```
 
-### 规划器
+### `Planner`规划器服务器
 
 - **负责**：从当前位置到目标点生成一条**全局路径**
 
 - **输入**：
+  
   - 当前机器人位姿（map系）
   - 目标位姿
   - 全局代价地图（global costmap）
-
+  
 - **输出**：`nav_msgs/Path话题`
 
 - **官方提供的规划器**：
@@ -52,7 +54,7 @@
 
   
 
-### 平滑器
+### `Smoother`平滑器服务器
 
 - **负责**：美化路径，把那些直角一样的路径变成曲线
 
@@ -76,7 +78,7 @@
 
 
 
-### 控制器
+### `Controller`控制器
 
 - **负责**：根据路径实时计算**速度指令**
 
@@ -109,12 +111,13 @@
     ros__parameters:
       controller_plugins: ["FollowPath"]
       FollowPath:
-         plugin: "dwb_core::DWBLocalPlanner"
+        plugin: "nav2_mppi_controller::MPPIController"
+        # 下面就是 MPPIController插件 的参数了...
   ```
-
+  
   
 
-### 恢复服务器
+### `Behaviors`行为服务器（恢复服务器）
 
 - **负责**：当导航失败时（如机器人卡墙了）尝试**自救**
 - **什么时候触发？**
@@ -129,6 +132,221 @@
   - **Backup**：后退
   - **Wait**：等待
   - **AssistedTeleop**：请求人工干预
+
+- yaml文件示例：
+
+  ```yaml
+  behavior_server:
+    ros__parameters:
+      local_costmap_topic: local_costmap/costmap_raw
+      global_costmap_topic: global_costmap/costmap_raw
+      local_footprint_topic: local_costmap/published_footprint
+      global_footprint_topic: global_costmap/published_footprint
+      cycle_frequency: 10.0
+      behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
+      spin:
+        plugin: "nav2_behaviors::Spin"
+      backup:
+        plugin: "nav2_behaviors::BackUp"
+      drive_on_heading:
+        plugin: "nav2_behaviors::DriveOnHeading"
+      wait:
+        plugin: "nav2_behaviors::Wait"
+      assisted_teleop:
+        plugin: "nav2_behaviors::AssistedTeleop"
+      local_frame: odom
+      global_frame: map
+      robot_base_frame: base_link
+      transform_tolerance: 0.1
+      simulate_ahead_time: 2.0
+      max_rotational_vel: 1.0
+      min_rotational_vel: 0.4
+      rotational_acc_lim: 3.2
+  ```
+
+  
+
+### `Route`路径服务器
+
+- **负责**：基于`导航图`生成路线。使用图搜索而不是自由空间规划，适合车道、teach-and-repeat 路线、城市道路等
+
+- **输入**：
+
+- **输出**：
+
+- yaml文件示例：
+
+  ```yaml
+  route_server:
+    ros__parameters:
+  
+      # graph文件路径（GeoJSON格式的路网图）
+      # 如果launch文件中已经指定graph，这里可以不写
+      # graph_filepath: $(find-pkg-share nav2_route)/graphs/aws_graph.geojson
+  
+      # 判断机器人是否到达节点的边界半径（米）
+      # 当机器人进入这个范围时就认为已经到达该节点
+      boundary_radius_to_achieve_node: 1.0
+  
+      # 触发节点切换的检测半径（米）
+      # 当机器人进入这个范围时，route server开始准备下一个节点
+      radius_to_achieve_node: 2.0
+  
+      # 是否平滑路径拐角
+      # true：路径会变成圆弧过渡
+      # false：机器人在节点处直角转弯
+      smooth_corners: true
+  
+      # 路径操作插件列表（执行顺序就是数组顺序）
+      # 用于在生成route之后进行额外处理
+      operations: ["AdjustSpeedLimit", "ReroutingService", "CollisionMonitor"]
+  
+      # ReroutingService 插件
+      # 用于动态重新规划route
+      # 当路径不可达或发生阻挡时重新规划
+      ReroutingService:
+        plugin: "nav2_route::ReroutingService"
+  
+      # AdjustSpeedLimit 插件
+      # 根据route graph中的属性动态调整机器人速度
+      # 例如：狭窄通道降低速度
+      AdjustSpeedLimit:
+        plugin: "nav2_route::AdjustSpeedLimit"
+  
+      # CollisionMonitor 插件
+      # 监测路径前方是否存在潜在碰撞
+      CollisionMonitor:
+        plugin: "nav2_route::CollisionMonitor"
+  
+        # 监测前方的最大碰撞检测距离（米）
+        # route_server会检查未来3米是否有障碍风险
+        max_collision_dist: 3.0
+  
+      # 路径评分函数列表
+      # 用于计算graph中每条边的cost
+      # Nav2会选择综合cost最低的路径
+      edge_cost_functions: ["DistanceScorer", "CostmapScorer"]
+  
+      # DistanceScorer
+      # 根据路径距离进行评分
+      # 距离越短，cost越低
+      DistanceScorer:
+        plugin: "nav2_route::DistanceScorer"
+  
+      # CostmapScorer
+      # 根据costmap代价进行评分
+      # 靠近障碍物的路径cost更高
+      CostmapScorer:
+        plugin: "nav2_route::CostmapScorer"
+  ```
+
+  
+
+
+
+### `Robot Footprints`机器人足迹服务器
+
+- 在代价地图中，我们设置机器人的足迹半径为一个圆，参数名为`robot_radius`
+- 但有些时候机器人不是圆形，而是要设为代表任意多
+
+
+
+### `Waypoint Following`航点跟踪服务器
+
+- **功能**：机器人按照一系列预定义目标点（waypoints）依次到达。
+
+  每个waypoint可以附带任务，例如：拍照、拾取物品、等待用户输入
+
+- 两种使用思路
+
+  - 第一种适合 **任务集中管理，机器人比较简单**
+  - 第二种适合 **机器人自主性高，需要本地复杂逻辑**
+
+  | 机器人能力               | 描述                                                         |
+  | ------------------------ | ------------------------------------------------------------ |
+  | 简单机器人，智能调度中心 | - 机器人只执行单个任务单元（1 pick / 1 patrol loop 等）<br />- 复杂任务和调度由后台系统处理<br />- Waypoint follower 就够用作生产级机器人上的应用 |
+  | 智能机器人，本地做决策   | - 机器人自己管理任务执行、充电状态等<br />- 可以在执行多个 waypoint 时动态决策<br />- 需要在机器人上使用 **Behavior Tree** 自定义导航和任务流程（Nav2 Behavior Tree + waypoint follower） |
+
+- yaml文件示例：
+
+  ```yaml
+  waypoint_follower:
+    ros__parameters:
+  
+      # Waypoint follower 主循环频率（Hz）
+      # 表示每秒检查 waypoint 任务状态的次数
+      loop_rate: 20
+  
+      # 是否在某个 waypoint 失败时停止整个任务
+      # true  -> 只要有一个 waypoint 失败，任务立即终止
+      # false -> 跳过失败的 waypoint，继续执行后面的 waypoint
+      stop_on_failure: false
+  
+      # Action server 返回结果的超时时间（秒）
+      # 如果导航 action 在该时间内没有返回结果，则认为任务失败
+      action_server_result_timeout: 900.0
+  
+      # waypoint 到达后执行的任务插件
+      # Nav2 waypoint follower 使用 pluginlib 机制
+      waypoint_task_executor_plugin: "wait_at_waypoint"
+  
+      # WaitAtWaypoint 插件配置
+      wait_at_waypoint:
+        # 插件类型
+        # 该插件实现：到达 waypoint 后等待一段时间
+        plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+  
+        # 是否启用该插件
+        enabled: True
+  
+        # 到达 waypoint 后暂停时间（毫秒）
+        # 200 ms = 0.2 秒
+        waypoint_pause_duration: 200
+  ```
+
+  效果：
+
+  ```
+  到达 waypoint
+       ↓
+  停 200ms
+       ↓
+  去下一个 waypoint
+  ```
+
+  - 如果需要自定义任务插件，如：拍照、抓取物体
+
+    就需要写 **自定义 waypoint plugin**。
+
+    插件继承：
+
+    ```c++
+    nav2_waypoint_follower::WaypointTaskExecutor
+    ```
+
+    然后在YAML注册：
+
+    ```yaml
+    waypoint_follower:
+      ros__parameters:
+    
+        waypoint_task_executor_plugin: "photo_task"
+    
+        photo_task:
+          plugin: "my_nav_plugins::TakePhotoAtWaypoint"	# 自定义插件名
+    ```
+
+    效果：
+
+    ```
+    到达 waypoint
+         ↓
+    执行 processAtWaypoint()
+         ↓
+    拍照
+         ↓
+    继续导航
+    ```
 
 
 
@@ -147,7 +365,7 @@
   >
   > `map`：地图坐标系（全局坐标系），用于表示 **机器人在地图中的绝对位置**
   >
-  > `odom`：局部里程计坐标系，由机器人运动积分产生，用于描述连续平滑的相对运动。因为机器人会**在每次运动时**打滑，导致机器人运动的目标位姿与**里程计(odom系)**计算出来的结果不一样，所以就有了`map -> odom`表示`定位系统`估计机器人打滑导致的误差并修正，这就导致我们在rviz中以map系为参考系时看到的odom系的位置会变化，也就是说
+  > `odom`：局部里程计坐标系，由机器人运动积分产生，用于描述连续平滑的相对运动。因为机器人会**在每次运动时**打滑，导致机器人运动的目标位姿与**里程计(odom系)**计算出来的结果不一样，所以就有了`map -> odom`表示`定位系统`估计机器人打滑导致的误差并修正，这就导致我们在rviz中以map系为参考系时看到的odom系的位置会一直不停地变化，也就是说
   >
   > ```
   > 机器人在map的实际位置 = 里程计估计的机器人运动的值值(odom->base_link) + 误差值(map->odom)
@@ -157,7 +375,7 @@
   >
   > `[sensor frames]`：机器人上的传感器坐标系（如激光雷达、相机、IMU 等）
 
-  - **全局定位系统**（如GPS、SLAM、动作捕捉）提供： `map` -> `odom` 的转换，表示**局部里程计坐标系在全局地图中的偏移量**
+  - **全局定位系统**（如GPS、SLAM、icp算法）提供： `map` -> `odom` 的转换，表示**局部里程计坐标系在全局地图中的偏移量**
 
     官方提供了两种全局定位系统：
 
@@ -165,7 +383,37 @@
 
     - `slam_toolbox`：slam_toolbox是一个独立的SLAM组件，专门用于给机器人进行**建图**和**定位**的。因为slam_toolbox是跟ros2紧密结合的，所以一般在实际运用中我们会使用`slam_toolbox`来进行机器人**定位**（即发布map->odom），然后使用NAV2来进行**导航**
 
-  - **里程计系统**提供：`odom` -> `base_link` 的转换，表示机器人在odom坐标系的实时位姿。
+  - **里程计系统**（如lio算法，vio算法）提供：`odom` -> `base_link` 的转换，表示机器人在odom坐标系的实时位姿。
+    
+    > **什么是里程计？**
+    >
+    > `里程计`是一种利用从`移动传感器`获得的数据来**估计物体位置随时间的变化而改变**的方法。该方法被用在许多机器人系统来估计机器人相对于初始位置移动的距离。
+    
+    常用的里程计有：
+    
+    - **轮式里程计（Wheel Odometry）**
+    
+      我们用一个例子来解释轮式里程计的原理，假设你现在拥有一辆马车，你想知道你驾驶马车从A地到B地要有多远。现在你知道了马车轮子的周长，然后你在轮子上安装了一种驾驶时可以统计车轮所转圈数的装置，通过马车的周长、从A地到B地所用的时间和所得的车轮圈数，你就能计算得出两地之间的路程了。
+    
+    - **视觉里程计（Visual Odometry）**
+    
+      视觉里程计是通过移动机器人上搭载的单个或多个相机的连续拍摄图像作为输入，从而增量式地估算移动机器人的运动状态。
+    
+      视觉里程计分为单目VO和双目VO。双目VO的优势在于，能够精确的估计运动轨迹，且具有确切的物理单位。在单目VO中，你仅仅只能知道移动机器人在x或y方向上移动了1个单位，而双目VO则可明确知道是移动了1cm。但是，对于距离很远的移动机器人，双目系统则会自动退化成为单目系统。
+    
+    - **激光雷达-惯性里程计（LiDAR-Inertial Odometry）**
+    
+      把 激光雷达 和 IMU 融合起来估计机器人运动。
+    
+    - **视觉-惯性里程计(visual-inertial Odometry)**
+    
+      融合了相机和IMU数据实现SLAM的一种算法。根据融合框架的不同又分为**松耦合**和**紧耦合**。
+    
+      `松耦合`中视觉运动估计和惯导运动估计系统是两个独立的模块，将每个模块的输出结果进行融合。
+    
+      `紧耦合`则是使用两个传感器的原始数据共同估计一组变量，传感器噪声也是相互影响的。紧耦合算法比较复杂，但充分利用了传感器数据，可以实现更好的效果，是目前研究的重点。
+    
+  - **机器人TF树**提供：`base_link` -> `[sensor frames]`的转换，也就是说需要我们人为写URDF或XACRO文件。值得注意的是， `base_link` -> `[sensor frames]`并不代表只能做一层转换，具体看传感器的摆放位置。如我的雷达是摆放在云台的，那么TF树应该是这样： `base_link` -> `gimble_link` -> `[sensor frames]`
     
     - 例如我们用的是**雷达**，就需要我们提供`base_link` -> `lidar`的转换
     - 如果用的是**深度相机**，就需要我们提供`base_link` -> `depth_camera`的转换
@@ -183,39 +431,10 @@
 
   - 为`规划器`和`控制器`提供数据
 
-### 代价地图图层(Costmap Layers)
-
-- **代价地图图层**是**代价地图**的组成成分，**一个代价地图**由**多个代价地图图层**组成
-
-- 每个**代价地图图层** 都是一个 **pluginlib 插件**
-  - **激光雷达layer**：用激光雷达生成障碍
-  - **深度相机layer**：也是依靠深度相机的数据来生成障碍
-  - **静态地图layer**：加载建好的地图或SLAM实时建的图
-  - **膨胀层inflation layer**：把障碍周围变成“危险区”
-
-- 一个**costmap layer** = 一个**往 costmap 里写数据的插件**，每个layer只负责一件事，如：
-  - 把激光雷达数据变成障碍
-  - 把地图加载进来
-  - 在障碍周围生成代价（变危险）
-  - 把视觉检测结果写进去
-
-- **官方提供的插件**：
-
-  > [!NOTE]
-  >
-  > 代价地图图层不只选择一个，可以选择很多个代价地图图层
-
-  | 插件名称                         | 主要功能               | 数据来源        | 维度 | 典型用途           | 推荐程度 / 备注  |
-  | -------------------------------- | ---------------------- | --------------- | ---- | ------------------ | ---------------- |
-  | **Static Layer（静态地图层）**   | 加载静态地图占用信息   | 地图服务器      | 2D   | 室内导航基础地图   | ⭐⭐⭐⭐⭐ 几乎必用   |
-  | **Obstacle Layer（动态障碍层）** | 根据2D激光维护动态障碍 | LaserScan       | 2D   | 动态避障           | ⭐⭐⭐⭐⭐ 常规必备   |
-  | **Inflation Layer（膨胀层）**    | 障碍物膨胀安全距离     | Costmap数据     | 2D   | 安全缓冲           | ⭐⭐⭐⭐⭐ 必备安全层 |
-  | **Voxel Layer（3D体素层）**      | 持久3D体素地图         | 深度相机 / 激光 | 3D   | 高度信息、立体障碍 | ⭐⭐⭐⭐ 3D感知常用  |
-  | **Range Layer**                  | 处理range传感器数据    | 超声波 / 红外   | 2D   | 近距离传感器       | ⭐⭐⭐ 特定传感器用 |
-  | **Spatio-Temporal Voxel Layer**  | 带时间衰减的3D体素地图 | 深度 / LiDAR    | 3D   | 动态环境建图       | ⭐⭐⭐⭐ 新一代3D层  |
-  | **Non-Persistent Voxel Layer**   | 非持久3D占用栅格       | 深度 / LiDAR    | 3D   | 临时障碍检测       | ⭐⭐⭐ 实时障碍     |
-  | **Denoise Layer**                | 去除孤立噪声障碍       | 任意传感器      | 2D   | 过滤误检           | ⭐⭐⭐⭐ 很实用      |
-  | **Plugin Container Layer**       | 组合多个layer          | 其他layer       | —    | 模块化组合         | ⭐⭐ 高级配置用    |
+- **导航算法使用这个环境表示来**：
+  - **Planner** -> 规划路径
+  - **Controller** -> 避开障碍跟踪路径
+  - **Behavior / Recovery** -> 判断是否需要恢复动作
 
 
 
@@ -223,7 +442,7 @@
 
 > Nav2 现在默认用的环境表示就是**Costmap**
 >
-> **代价地图**本质是一个`2D网络地图`
+> **代价地图**本质是一个`二维网格地图（2D grid map）`
 
 Costmap中每一个格子都有一个代价值，如：
 
@@ -238,11 +457,64 @@ Costmap中每一个格子都有一个代价值，如：
 
 - `控制器服务器`在局部区域 **采样运动**
 
+
+
+### 代价地图图层(Costmap Layers)
+
+> **代价地图图层**是**代价地图**的组成成分，**一个代价地图**由**多个代价地图图层**组成
+
+- 每个**代价地图图层** 都是一个 **pluginlib 插件**，典型的`图层（layer）`有：
+
+  - **激光雷达`Obstacle layer`**：用激光雷达生成障碍
+  - **深度相机`Obstacle layer`**：也是依靠深度相机的数据来生成障碍
+  - **静态地图`Static layer`**：加载建好的地图或SLAM实时建的图
+  - **膨胀层`inflation layer`**：把障碍周围变成“危险区”
+
+- 一个**costmap layer** = 一个**往 costmap 里写数据的插件**，每个layer只负责一件事，如：
+
+  - 把激光雷达数据变成障碍
+  - 把地图加载进来
+  - 在障碍周围生成代价（变危险）
+  - 把视觉检测结果写进去
+
+- **官方提供的插件**：
+
+  > [!NOTE] 
+  >
+  > 代价地图图层不只选择一个，可以选择很多个代价地图图层
+
+  | 插件名称                        | 主要功能               | 数据来源        | 维度 | 典型用途           | 推荐程度 / 备注  |
+  | ------------------------------- | ---------------------- | --------------- | ---- | ------------------ | ---------------- |
+  | **Static Layer**                | 加载静态地图占用信息   | 地图服务器      | 2D   | 室内导航基础地图   | ⭐⭐⭐⭐⭐ 几乎必用   |
+  | **Obstacle Layer**              | 根据2D激光维护动态障碍 | LaserScan       | 2D   | 动态避障           | ⭐⭐⭐⭐⭐ 常规必备   |
+  | **Inflation Layer**             | 障碍物膨胀安全距离     | Costmap数据     | 2D   | 安全缓冲           | ⭐⭐⭐⭐⭐ 必备安全层 |
+  | **Voxel Layer**                 | 持久3D体素地图         | 深度相机 / 激光 | 3D   | 高度信息、立体障碍 | ⭐⭐⭐⭐ 3D感知常用  |
+  | **Range Layer**                 | 处理range传感器数据    | 超声波 / 红外   | 2D   | 近距离传感器       | ⭐⭐⭐ 特定传感器用 |
+  | **Spatio-Temporal Voxel Layer** | 带时间衰减的3D体素地图 | 深度 / LiDAR    | 3D   | 动态环境建图       | ⭐⭐⭐⭐ 新一代3D层  |
+  | **Non-Persistent Voxel Layer**  | 非持久3D占用栅格       | 深度 / LiDAR    | 3D   | 临时障碍检测       | ⭐⭐⭐ 实时障碍     |
+  | **Denoise Layer**               | 去除孤立噪声障碍       | 任意传感器      | 2D   | 过滤误检           | ⭐⭐⭐⭐ 很实用      |
+  | **Plugin Container Layer**      | 组合多个layer          | 其他layer       | —    | 模块化组合         | ⭐⭐ 高级配置用    |
+
+- yaml文件配置示例：
+
+  ```yaml
+  local_costmap:	# 这是代价地图
+    local_costmap:
+      ros__parameters:
+      plugins: ["voxel_layer", "inflation_layer"]		# 在这里填写代价地图图层（以插件形式存在）
+    	inflation_layer:
+    		plugin: "nav2_costmap_2d::InflationLayer"
+    		# inflation_layer插件 的详细配置...
+    	voxel_layer:
+          plugin: "nav2_costmap_2d::VoxelLayer"
+          # voxel_layer插件 的详细配置...
+  ```
+
   
 
 ### 代价地图过滤器(Costmap Filters)
 
-> `代价地图过滤器`不是用传感器改变地图，而是**用`规则地图`改变机器人的行为**。
+> `核心思想`：在地图上标记区域，让机器人在不同区域有不同规则。
 
 - 代价地图过滤器的输入不是现实世界，而是 **人为定义的语义规则**
 - 简单的说，`代价地图过滤器`就是在`代价地图`上标注出：
@@ -250,7 +522,7 @@ Costmap中每一个格子都有一个代价值，如：
   - 速度限制区域。进入这些区域的机器人的最大速度将受限制。
   - 机器人在工业环境和仓库中移动的优选路径。
 
-- `代价地图过滤器`与`代价地图层`的本质区别
+- `代价地图过滤器`与`代价地图图层`的本质区别
 
   | 维度     | Costmap Layer  | Costmap Filter |
   | -------- | -------------- | -------------- |
@@ -280,6 +552,253 @@ Costmap中每一个格子都有一个代价值，如：
 
 
 
+### NAV2中的默认环境表达
+
+🤔如果我们去看NAV2的默认配置文件，可以看到里面使用了**两个`代价地图`**：`local_costmap`和`global_costmap`：
+
+> 在 **Nav2** 中同时存在 `Global Costmap` 和 `Local Costmap`，主要是因为 **全局规划（规划器）** 和 **局部控制（控制器）** 对环境信息的需求完全不同。可以理解为：**一个看远（规划路线），一个看近（避障控制）**。
+>
+> ```mermaid
+> flowchart LR
+>     Map[全局地图] --> GlobalCostmap[Global Costmap]
+>     Sensors[激光/深度相机] --> LocalCostmap[Local Costmap]
+> 
+>     GlobalCostmap --> Planner[Planner Server<br>全局路径规划]
+>     Planner --> Path[Global Path]
+> 
+>     Path --> Controller[Controller Server]
+>     LocalCostmap --> Controller
+> 
+>     Controller --> CmdVel[cmd_vel 速度控制]
+> ```
+
+```yaml
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05
+      robot_radius: 0.22
+      plugins: ["voxel_layer", "inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.70
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: True
+        publish_voxel_map: True
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+        max_obstacle_height: 2.0
+        mark_threshold: 0
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      always_send_full_costmap: True
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      robot_radius: 0.22
+      resolution: 0.05
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.7
+      always_send_full_costmap: True
+```
+
+
+
+# NAV2行为树
+
+> NAV2定义了很多只有`NAV2 BT`才有，而原始的BT没有的节点
+
+🤔如果我写了一个BT树：`navigate_with_replanning.xml`
+
+```xml
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="NavigateWithReplanning">
+      <DistanceController distance="1.0">
+        <ComputePathToPose goal="{goal}" path="{path}"/>
+      </DistanceController>
+      <FollowPath path="{path}"/>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>
+```
+
+那么怎么把这个BT树塞到Nav2中？
+
+需要在Nav2参数文件`nav2_params.yaml`中：
+
+- `bt_navigator` 节点加载
+
+- 通过参数 `default_nav_to_pose_bt_xml` 指定 XML 文件路径
+
+  ```yaml
+  bt_navigator:
+    ros__parameters:
+      global_frame: map
+      robot_base_frame: base_link
+      odom_topic: /odom
+      bt_loop_duration: 10
+      default_server_timeout: 20
+      wait_for_service_timeout: 1000
+      action_server_result_timeout: 900.0
+  
+      navigators: ["navigate_to_pose", "navigate_through_poses"]
+  
+      navigate_to_pose:
+        plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+        default_bt_xml_filename: "/home/xxx/ros2_ws/src/my_pkg/behavior_trees/navigate_with_replanning.xml"
+  
+      navigate_through_poses:
+        plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+        default_bt_xml_filename: "/home/xxx/ros2_ws/src/my_pkg/behavior_trees/navigate_with_replanning.xml"
+  
+      plugin_lib_names: []
+  
+      error_code_names:
+        - compute_path_error_code
+        - follow_path_error_code
+  ```
+
+> [!WARNING]
+>
+> Nav2 里两个 Navigator 的 Action类型 和 输入端口 不同：
+>
+> | Navigator                | Action 类型                             | 输入端口  |
+> | ------------------------ | --------------------------------------- | --------- |
+> | `navigate_to_pose`       | `nav2_msgs/action/NavigateToPose`       | `{goal}`  |
+> | `navigate_through_poses` | `nav2_msgs/action/NavigateThroughPoses` | `{goals}` |
+
+## Action Nodes（动作节点）
+
+这些节点通常会调用 **Nav2 的 Action Server 或 Service** 来执行实际导航行为。
+ 返回状态：
+
+- `SUCCESS`：任务完成
+- `RUNNING`：正在执行
+- `FAILURE`：执行失败
+
+### ComputePathToPose
+
+**作用**：调用 **planner server（规划器服务器）** 计算从当前机器人位置到目标 pose 的`路径`。
+
+**输入：**
+
+- `goal`：目标位置
+- `planner_id`：规划算法
+
+**输出：**
+
+- `path`：规划出来的路径
+
+**调用Nav2模块：**planner_server（规划器服务器）
+
+**典型BT用法：**
+
+```xml
+<ComputePathToPose goal="{goal}" path="{path}"/>
+```
+
+### FollowPath
+
+**作用：**调用 **controller server（控制器服务器）** 根据 path 进行路径跟踪。
+
+**输入：**
+
+- path
+- controller_id
+
+**调用Nav2模块：**controller_server（控制器服务器）
+
+控制器可能是：
+
+- DWB
+- RegulatedPurePursuit
+- TEB 等
+
+### Spin
+
+**作用：**让机器人 **原地旋转一定角度**。
+
+常用于：
+
+- 重新观察环境
+- 恢复行为（recovery）
+
+**调用Nav2模块：**behavior_server
+
+
+
+## Condition Nodes（条件节点）
+
+| 节点名称              | 功能说明                            |
+| --------------------- | ----------------------------------- |
+| `GoalUpdated`         | 检查是否收到新的目标                |
+| `GoalReached`         | 判断是否已经到达目标位置            |
+| `InitialPoseReceived` | 检查是否接收过初始位姿              |
+| `isBatteryLow`        | 检查电量是否低（自定义 topic 条件） |
+
+
+
+## Decorator Nodes（装饰器节点）
+
+| 节点名称             | 功能说明                                                   |
+| -------------------- | ---------------------------------------------------------- |
+| `DistanceController` | 当机器人移动超过设定距离后才 tick 子节点（用于重规划机制） |
+| `RateController`     | 以固定频率控制子节点执行                                   |
+| `GoalUpdater`        | 在执行子节点前更新目标 (via ports)                         |
+| `SingleTrigger`      | 只允许子节点执行一次（之后返回失败）                       |
+| `SpeedController`    | 依据机器人速度来控制子节点 tick 频率                       |
+
+
+
 # 2 导航进阶
 
 ## 2.1 自定义规划器
@@ -304,7 +823,7 @@ Costmap中每一个格子都有一个代价值，如：
     	builtin_interfaces/Time stamp
     		int32 sec
     		uint32 nanosec
-    	string frame_id
+    	string frame_idlocal_costmap
     
     # Array of poses to follow.
     geometry_msgs/PoseStamped[] poses		# 我们可以看到，路径是由多个点组成的
@@ -366,9 +885,6 @@ Costmap中每一个格子都有一个代价值，如：
     ```
 
 
-- **坐标转换**
-
-
 
 ### 2.1.2 搭建规划器插件框架
 
@@ -389,11 +905,11 @@ Costmap中每一个格子都有一个代价值，如：
     ├── CMakeLists.txt
     ├── include
     │   └── nav2_custom_planner
-    │       └── nav2_custom_planner.hpp		# 插件实现类的代码声明（继承抽象类的类，这里的抽象类是nav2_core::GlobalPlanner）
+    │       └── nav2_custom_planner.hpp	# 插件实现类的代码声明（继承抽象类的类，这里的抽象类是nav2_core::GlobalPlanner）
     ├── package.xml
-    ├── plugin.xml												# 插件描述文件
+    ├── plugin.xml						# 插件描述文件
     └── src
-        └── nav2_custom_planner.cpp				# 插件实现类的代码实现
+        └── nav2_custom_planner.cpp		# 插件实现类的代码实现
   ```
 
 - 定义`插件的实现类`：**nav2_custom_planner.hpp**
@@ -540,9 +1056,87 @@ Costmap中每一个格子都有一个代价值，如：
 
 ### 2.1.3 实现自定义规划算法
 
-这里采用最简单的`直线规划策略`，当收到规划请求时，直接生成一个从当前位置到目标位置的直线路径，同时在规划时会判断路径上是否有障碍物，如果存在则抛出异常，表示规划失败
+#### 朴素dijkstra
 
- 
+```c++
+#include <bits/stdc++.h>
+using namespace std;
+
+vector<vector<int>> graph;  // 边表：每一行表示 {起点, 终点, 权重}
+vector<int> cost;           // 记录起点到各个节点的最短距离
+vector<bool> st;            // 记录节点是否已经确定为最短路节点
+
+void dijkstra(int start)
+{
+    // 初始化起点距离
+    cost[start] = 0;
+
+    // 最多遍历 n 次（n 为节点数）
+    for (int i = 0; i < cost.size(); i++)
+    {
+        int temp = 0x3f3f3f3f;  // 当前最小距离
+        int k = -1;             // 当前距离最小的节点
+        // 在所有未确定最短路的节点中找到 dist 最小的节点
+        for (int j = 0; j < cost.size(); j++)
+        {
+            if (!st[j] && cost[j] < temp)
+            {
+                temp = cost[j];
+                k = j;
+            }
+        }
+        // 如果没有找到可用节点，说明图已经遍历完
+        if (k == -1) break;
+        // 将该节点标记为已确定最短路径
+        st[k] = true;
+
+
+        // 使用该节点更新其它节点的距离（松弛操作）
+        for (int m = 0; m < graph.size(); m++)
+        {
+            int from = graph[m][0]; // 边的起点
+            int to = graph[m][1];   // 边的终点
+            int w = graph[m][2];    // 边的权重
+
+            // 如果这条边是从当前节点 k 出发
+            if (from == k)
+            {
+                // 更新最短距离
+                cost[to] = min(cost[to], cost[k] + w);
+            }
+        }
+    }
+}
+
+int main()
+{
+    // 图的边表表示
+    // 每一行：{起点, 终点, 权重}
+    graph = {
+        {0,1,10},
+        {0,3,30},
+        {0,4,100},
+        {1,2,50},
+        {2,4,10},
+        {3,2,20},
+        {3,4,60}
+    };
+    int n = 5; // 节点数量
+    st = vector<bool>(n, false);    // 初始化访问数组
+    cost = vector<int>(n, 0x3f3f3f3f);   // 初始化最短路径数组
+
+    // 从节点 0 开始计算最短路径
+    dijkstra(0);
+
+    // 输出结果
+    for (int i = 0; i < n; i++)
+    {
+        cout << "0 -> " << i << " : " << cost[i] << endl;
+    }
+}
+```
+
+
 
 
 
